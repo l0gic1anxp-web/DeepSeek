@@ -8,7 +8,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 
 from config import (
-    BOT_TOKEN, ADMIN_ID, AI_MODEL, AI_REASONING_MODEL,
+    BOT_TOKEN, ADMIN_ID,
     ADMIN_TIMEOUT, MAX_HISTORY_CHARS, USER_COOLDOWN,
 )
 from db import (
@@ -137,7 +137,6 @@ async def handle_ai_stream(msg: types.Message, user: types.User):
 
     history = await get_history(user.id, max_chars=MAX_HISTORY_CHARS)
 
-    model = AI_REASONING_MODEL if mode == "reasoning" else AI_MODEL
     system_prompt = build_system_prompt(user.full_name, mode)
 
     placeholder = await msg.answer("⏳ <i>Думаю…</i>")
@@ -147,7 +146,7 @@ async def handle_ai_stream(msg: types.Message, user: types.User):
     loop = asyncio.get_event_loop()
 
     try:
-        stream = await ask_ai_stream(model, system_prompt, history, max_tokens=4000)
+        stream = await ask_ai_stream(mode, system_prompt, history, max_tokens=4000)
         async for delta in stream:
             buffer += delta
             now = loop.time()
@@ -403,4 +402,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())

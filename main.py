@@ -32,9 +32,8 @@ dp = Dispatcher()
 
 processing_users: set[int] = set()
 last_request: dict[int, float] = {}
+# message_id у админа -> данные заявки
 pending: dict[int, dict] = {}
-
-STREAM_EDIT_INTERVAL = 1.5
 
 
 @dp.message(Command("start"))
@@ -139,32 +138,15 @@ async def handle_ai_stream(msg: types.Message, user: types.User):
 
     system_prompt = build_system_prompt(user.full_name, mode)
 
+    # Юзер видит только "Думаю…". Этот placeholder потом отредактируем в ответ.
     placeholder = await msg.answer("⏳ <i>Думаю…</i>")
 
     buffer = ""
-    last_edit = 0.0
-    loop = asyncio.get_event_loop()
 
     try:
         stream = await ask_ai_stream(mode, system_prompt, history, max_tokens=4000)
         async for delta in stream:
             buffer += delta
-            now = loop.time()
-
-            if now - last_edit >= STREAM_EDIT_INTERVAL:
-                preview = buffer.strip()
-                if len(preview) > 3800:
-                    preview = preview[-3800:]
-                text_to_send = f"✍️ <i>Печатаю…</i>\n\n{preview} ▌"
-                try:
-                    await placeholder.edit_text(text_to_send[:4096], parse_mode=None)
-                    last_edit = now
-                except TelegramRetryAfter as e:
-                    await asyncio.sleep(e.retry_after)
-                except TelegramBadRequest:
-                    pass
-                except Exception:
-                    pass
     except Exception as e:
         log.exception("AI error")
         try:
@@ -177,17 +159,25 @@ async def handle_ai_stream(msg: types.Message, user: types.User):
 
     await save_message(user.id, user.username, user.full_name, "assistant", buffer, mode)
 
-    try:
-        await placeholder.delete()
-    except Exception:
-        pass
-
-    await send_to_admin_for_moderation(user, question, buffer, mode)
+    # Отправляем админу, но НЕ трогаем placeholder юзера
+    await send_to_admin_for_moderation(
+        user, question, buffer, mode,
+        user_chat_id=msg.chat.id,
+        user_placeholder_id=placeholder.message_id,
+    )
 
 
 async def send_to_admin_for_moderation(
-    user: types.User, question: str, answer: str, mode: str
+    user: types.User,
+    question: str,
+    answer: str,
+    mode: str,
+    user_chat_id: int,
+    user_placeholder_id: int,
 ):
+    """Отправляет админу диалог и запускает таймер авто-отправки.
+    Юзер в это время видит 'Думаю…'.
+    """
     header = (
         f"👤 <b>{user.full_name}</b> (@{user.username or 'без_ника'}) | "
         f"<code>{user.id}</code>\n"
@@ -202,30 +192,46 @@ async def send_to_admin_for_moderation(
             disable_web_page_preview=True,
             reply_markup=moderation_kb(user.id),
         )
+        # Ответ отдельным сообщением
         html_answer = md_to_html(answer)
         chunks = split_message(html_answer)
-        answer_msgs = []
+        answer_msg_ids = []
         for ch in chunks:
             m = await bot.send_message(ADMIN_ID, ch, disable_web_page_preview=True)
-            answer_msgs.append(m.message_id)
+            answer_msg_ids.append(m.message_id)
     except Exception:
         log.exception("Не смог отправить админу")
-        await auto_send_to_user(user.id, answer, mode)
+        # Админ недоступен — сразу юзеру
+        await auto_send_to_user(
+            user_chat_id, user_placeholder_id, user.id, answer, mode
+        )
         return
 
     task = asyncio.create_task(
-        _auto_send_later(sent.message_id, user.id, answer, mode)
+        _auto_send_later(
+            sent.message_id, user_chat_id, user_placeholder_id, user.id, answer, mode
+        )
     )
     pending[sent.message_id] = {
         "user_id": user.id,
+        "user_chat_id": user_chat_id,
+        "user_placeholder_id": user_placeholder_id,
         "answer": answer,
         "mode": mode,
         "task": task,
-        "answer_msgs": answer_msgs,
+        "header_msg_id": sent.message_id,
+        "answer_msg_ids": answer_msg_ids,
     }
 
 
-async def _auto_send_later(msg_id: int, user_id: int, answer: str, mode: str):
+async def _auto_send_later(
+    msg_id: int,
+    user_chat_id: int,
+    user_placeholder_id: int,
+    user_id: int,
+    answer: str,
+    mode: str,
+):
     try:
         await asyncio.sleep(ADMIN_TIMEOUT)
     except asyncio.CancelledError:
@@ -233,7 +239,7 @@ async def _auto_send_later(msg_id: int, user_id: int, answer: str, mode: str):
     if msg_id not in pending:
         return
     try:
-        await auto_send_to_user(user_id, answer, mode)
+        await auto_send_to_user(user_chat_id, user_placeholder_id, user_id, answer, mode)
         try:
             await bot.send_message(
                 ADMIN_ID,
@@ -249,7 +255,14 @@ async def _auto_send_later(msg_id: int, user_id: int, answer: str, mode: str):
         pending.pop(msg_id, None)
 
 
-async def auto_send_to_user(user_id: int, answer: str, mode: str):
+async def auto_send_to_user(
+    user_chat_id: int,
+    user_placeholder_id: int,
+    user_id: int,
+    answer: str,
+    mode: str,
+):
+    """Редактирует placeholder юзера в финальный красивый ответ."""
     reasoning, main = split_reasoning(answer)
 
     parts = []
@@ -269,9 +282,28 @@ async def auto_send_to_user(user_id: int, answer: str, mode: str):
     chunks = split_message(full)
 
     try:
-        await bot.send_message(user_id, chunks[0], disable_web_page_preview=True)
+        # Первый чанк — редактируем placeholder юзера
+        await bot.edit_message_text(
+            chat_id=user_chat_id,
+            message_id=user_placeholder_id,
+            text=chunks[0],
+            disable_web_page_preview=True,
+        )
+        # Остальные чанки — новыми сообщениями
         for ch in chunks[1:]:
-            await bot.send_message(user_id, ch, disable_web_page_preview=True)
+            await bot.send_message(
+                user_chat_id, ch, disable_web_page_preview=True
+            )
+    except TelegramBadRequest as e:
+        # Если placeholder уже нельзя редактировать — шлём новым сообщением
+        log.warning(f"Не смог отредактировать placeholder: {e}")
+        try:
+            for ch in chunks:
+                await bot.send_message(
+                    user_chat_id, ch, disable_web_page_preview=True
+                )
+        except Exception:
+            log.exception(f"Не смог отправить пользователю {user_id}")
     except Exception:
         log.exception(f"Не смог отправить пользователю {user_id}")
 
@@ -279,7 +311,6 @@ async def auto_send_to_user(user_id: int, answer: str, mode: str):
 @dp.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("mod:"))
 async def on_moderation(cb: CallbackQuery):
     _, action, user_id_str = cb.data.split(":")
-    user_id = int(user_id_str)
     msg_id = cb.message.message_id
 
     entry = pending.get(msg_id)
@@ -291,19 +322,26 @@ async def on_moderation(cb: CallbackQuery):
 
     if action == "send":
         await cb.message.edit_reply_markup(reply_markup=None)
-        await auto_send_to_user(user_id, entry["answer"], entry["mode"])
+        await auto_send_to_user(
+            entry["user_chat_id"],
+            entry["user_placeholder_id"],
+            entry["user_id"],
+            entry["answer"],
+            entry["mode"],
+        )
         await cb.answer("✅ Отправлено")
-        await cb.message.reply(f"✅ Отправлено <code>{user_id}</code>")
+        await cb.message.reply(f"✅ Отправлено <code>{entry['user_id']}</code>")
         pending.pop(msg_id, None)
 
     elif action == "reject":
         await cb.message.edit_reply_markup(reply_markup=None)
         await cb.answer("❌ Отклонено")
-        await cb.message.reply(f"❌ Отклонено для <code>{user_id}</code>")
+        await cb.message.reply(f"❌ Отклонено для <code>{entry['user_id']}</code>")
         try:
-            await bot.send_message(
-                user_id,
-                "🙏 Извини, не могу ответить на этот запрос. Попробуй переформулировать.",
+            await bot.edit_message_text(
+                chat_id=entry["user_chat_id"],
+                message_id=entry["user_placeholder_id"],
+                text="🙏 Извини, не могу ответить на этот запрос. Попробуй переформулировать.",
             )
         except Exception:
             pass
@@ -313,7 +351,7 @@ async def on_moderation(cb: CallbackQuery):
         await cb.answer()
         await cb.message.reply(
             "✏️ Отправь новый текст <b>ответом</b> на это сообщение — "
-            f"он уйдёт пользователю <code>{user_id}</code>."
+            f"он уйдёт пользователю <code>{entry['user_id']}</code>."
         )
 
 
@@ -321,9 +359,14 @@ async def on_moderation(cb: CallbackQuery):
 async def admin_edit_reply(msg: types.Message):
     reply_id = msg.reply_to_message.message_id
 
+    # Ищем pending: либо reply на заголовок, либо на ответ
     target_id = None
     for mid, entry in pending.items():
-        if mid == reply_id or reply_id in entry.get("answer_msgs", []):
+        if (
+            mid == reply_id
+            or reply_id == entry.get("header_msg_id")
+            or reply_id in entry.get("answer_msg_ids", [])
+        ):
             target_id = mid
             break
 
@@ -332,9 +375,14 @@ async def admin_edit_reply(msg: types.Message):
 
     entry = pending[target_id]
     entry["task"].cancel()
-    entry["answer"] = msg.text
 
-    await auto_send_to_user(entry["user_id"], msg.text, entry["mode"])
+    await auto_send_to_user(
+        entry["user_chat_id"],
+        entry["user_placeholder_id"],
+        entry["user_id"],
+        msg.text,
+        entry["mode"],
+    )
     await msg.reply(
         f"✅ Отправлено пользователю <code>{entry['user_id']}</code>"
     )

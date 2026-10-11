@@ -1,5 +1,9 @@
+import logging
+import httpx
 from openai import AsyncOpenAI
 from config import AI_API_KEY, AI_BASE_URL
+
+log = logging.getLogger(__name__)
 
 client = AsyncOpenAI(
     api_key=AI_API_KEY,
@@ -9,6 +13,74 @@ client = AsyncOpenAI(
         "X-Title": "Telegram AI Bot",
     },
 )
+
+_chat_model: str | None = None
+_reasoning_model: str | None = None
+
+
+async def _fetch_free_models() -> list[str]:
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            r = await http.get("https://openrouter.ai/api/v1/models")
+            data = r.json()
+    except Exception as e:
+        log.exception(f"Не смог получить список моделей: {e}")
+        return []
+
+    free = []
+    for m in data.get("data", []):
+        model_id = m.get("id", "")
+        pricing = m.get("pricing", {})
+        prompt_price = float(pricing.get("prompt", "1") or "1")
+        completion_price = float(pricing.get("completion", "1") or "1")
+
+        if prompt_price == 0 and completion_price == 0:
+            free.append(model_id)
+
+    log.info(f"Найдено {len(free)} бесплатных моделей")
+    return free
+
+
+async def _pick_models():
+    global _chat_model, _reasoning_model
+    if _chat_model and _reasoning_model:
+        return _chat_model, _reasoning_model
+
+    free = await _fetch_free_models()
+    if not free:
+        _chat_model = "meta-llama/llama-3.3-70b-instruct:free"
+        _reasoning_model = "deepseek/deepseek-r1:free"
+        log.warning(f"Список пуст, fallback: {_chat_model}")
+        return _chat_model, _reasoning_model
+
+    chat_priority = [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "google/gemini-2.0-flash-exp:free",
+        "qwen/qwen-2.5-72b-instruct:free",
+        "mistralai/mistral-nemo:free",
+    ]
+    reasoning_priority = [
+        "deepseek/deepseek-r1:free",
+        "deepseek/deepseek-r1-distill-llama-70b:free",
+        "qwen/qwq-32b-preview:free",
+    ]
+
+    def pick(priority, all_models):
+        for p in priority:
+            if p in all_models:
+                return p
+        return all_models[0]
+
+    _chat_model = pick(chat_priority, free)
+    _reasoning_model = pick(reasoning_priority, free)
+
+    log.info(f"Выбраны модели: chat={_chat_model}, reasoning={_reasoning_model}")
+    return _chat_model, _reasoning_model
+
+
+async def _get_model_for_mode(mode: str) -> str:
+    chat_m, reasoning_m = await _pick_models()
+    return reasoning_m if mode == "reasoning" else chat_m
 
 
 def build_system_prompt(user_name: str, mode: str) -> str:
@@ -59,7 +131,9 @@ def build_system_prompt(user_name: str, mode: str) -> str:
     return base
 
 
-async def ask_ai_stream(model: str, system_prompt: str, history: list, max_tokens: int = 4000):
+async def ask_ai_stream(mode: str, system_prompt: str, history: list, max_tokens: int = 4000):
+    model = await _get_model_for_mode(mode)
+
     stream = await client.chat.completions.create(
         model=model,
         messages=[{"role": "system", "content": system_prompt}] + history,
@@ -76,4 +150,4 @@ async def ask_ai_stream(model: str, system_prompt: str, history: list, max_token
             if delta:
                 yield delta
 
-    return gen() 
+    return gen()
